@@ -1,0 +1,4 @@
+gate,split_windows,positive_windows,threshold,total_escalations,escalation_rate,llm_call_reduction,tp,fp,fn,tn,recall,precision,f1,fp_rate,hard_floor_escalations,hard_floor_esc_rate,hard_floor_tp,hard_floor_fp,learner_escalations,learner_esc_rate,learner_tp,learner_fp
+AlwaysEscalate,28076,1372,N/A,28076,1.0,0.0,1372,26704,0,0,1.0,0.0489,0.0932,1.0,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
+AlwaysThreshold,28076,1372,0.32760733366012573,13014,0.4635,0.5365,233,12781,1139,13923,0.1698,0.0179,0.0324,0.4786,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
+ReasoningGate,28076,1372,0.3276,14394,0.5127,0.4873,1332,13062,40,13642,0.9708,0.0925,0.169,0.4891,3,0.0001,0,3,14394,0.5127,1332,13062
