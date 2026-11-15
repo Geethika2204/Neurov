@@ -338,3 +338,28 @@ Potential spatial columns:
 
 Potential time columns:
     ['day', 'unix_time']
+
+======================================================================
+CRASH COUNT
+======================================================================
+
+Total dataset rows      : 940,800
+Total crash rows        : 2,156   (crash_record == 1)
+Crash percentage        : 0.2292%
+
+Unique crash timestamps : 44      (distinct unix_time values with crash_record == 1)
+Unique milemarkers      : 49      (all 49 milemarkers have at least one crash row)
+
+Human label crashes     : 931     (human_label == 1)
+crash_record crashes    : 2,156   (crash_record == 1)
+
+Note — the difference between the two labels:
+  human_label = 931  → manually annotated crash events only
+  crash_record = 2,156 → broader label used by the model (includes near-crashes
+                          and automatically flagged records)
+  The pipeline uses crash_record as the ground truth.
+
+Relationship to windows (test split):
+  Crash windows (test)  : 1,372  (windows where any of 20 timesteps has crash_record==1)
+  Total test windows    : 28,076
+  One real crash event spans multiple overlapping windows (STRIDE=5, WINDOW=20).

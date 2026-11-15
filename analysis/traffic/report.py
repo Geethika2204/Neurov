@@ -265,8 +265,10 @@ def save_plots(rows: list[dict], dist_rows: list[dict]) -> None:
     plt.close(fig)
     print(f"  Saved → {p.relative_to(REPO_ROOT)}")
 
-    # ── Plot 2: ReasoningScore distributions (val split) ─────────────────
+    # ── Plot 2: ReasoningScore distributions (val or test split) ──────────
     val_dists = [r for r in dist_rows if r["split"] == "val"]
+    if not val_dists:
+        val_dists = dist_rows  # fall back to whatever split is present
     fields = ["novelty", "uncertainty", "prediction_error", "memory_confidence", "spatial_correlation", "risk"]
     normal = [r for r in val_dists if int(r["label"]) == 0]
     crash  = [r for r in val_dists if int(r["label"]) == 1]
@@ -293,7 +295,8 @@ def save_plots(rows: list[dict], dist_rows: list[dict]) -> None:
         ax.set_ylabel("Density")
         ax.legend(fontsize=8)
 
-    fig.suptitle("ReasoningScore Distributions — Val Split\n(Normal vs Crash windows)",
+    actual_split = val_dists[0]["split"].upper() if val_dists else "TEST"
+    fig.suptitle(f"ReasoningScore Distributions — {actual_split} Split\n(Normal vs Crash windows)",
                  fontsize=11)
     fig.tight_layout()
     p = out / "plot_score_distributions.png"
@@ -335,6 +338,14 @@ def main() -> None:
 
     rows      = load_csv(RESULTS_CSV)
     dist_rows = load_csv(DISTS_CSV)
+
+    # Backfill 'split' column if evaluate.py was run without it
+    if rows and "split" not in rows[0]:
+        for r in rows:
+            r["split"] = "test"
+    if dist_rows and "split" not in dist_rows[0]:
+        for r in dist_rows:
+            r["split"] = "test"
 
     print("\n" + "="*62)
     print("  NEUROVERSE — GATE COMPARISON ANALYSIS REPORT")

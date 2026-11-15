@@ -122,6 +122,45 @@ def _import_langchain_anthropic(model_name: str):
         ) from exc
 
 
+def _import_langchain_ollama(model_name: str):
+    """Return a ChatOllama LLM bound to the given local model name."""
+    try:
+        from langchain_ollama import ChatOllama
+        return ChatOllama(model=model_name, temperature=0.1)
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-ollama is required for local Ollama models. "
+            "Install it with: pip install langchain-ollama"
+        ) from exc
+
+
+def _build_llm(model_name: str):
+    """
+    Auto-select the right LangChain backend based on the model name prefix.
+
+    - ``"ollama:<name>"`` or ``"<name>"`` without a slash → ChatOllama
+    - Everything else → ChatAnthropic (default)
+
+    Examples::
+
+        _build_llm("ollama:llama3.2:3b")  → ChatOllama(model="llama3.2:3b")
+        _build_llm("llama3.2:3b")         → ChatOllama(model="llama3.2:3b")
+        _build_llm("claude-3-5-sonnet-…") → ChatAnthropic(model=…)
+    """
+    # Explicit ollama: prefix
+    if model_name.startswith("ollama:"):
+        return _import_langchain_ollama(model_name[len("ollama:"):])
+
+    # Heuristic: llama / mistral / gemma / phi / qwen → local Ollama
+    _LOCAL_PREFIXES = ("llama", "mistral", "gemma", "phi", "qwen",
+                       "deepseek", "codellama", "vicuna", "falcon")
+    if any(model_name.lower().startswith(p) for p in _LOCAL_PREFIXES):
+        return _import_langchain_ollama(model_name)
+
+    # Default: Anthropic Claude
+    return _import_langchain_anthropic(model_name)
+
+
 def _import_chromadb():
     try:
         import chromadb
@@ -201,19 +240,22 @@ class LLMAgentPlugin:
     """
 
     SYSTEM_PROMPT = (
-        "You are an anomaly detection agent for a sensor monitoring system. "
-        "You will receive a sensor event and may call tools to retrieve "
-        "relevant context from a knowledge base. "
-        "Always respond with a JSON object with keys: "
-        "label (string), confidence (0-1 float), reasoning (string). "
-        "Be conservative: when uncertain, prefer to flag as anomalous "
-        "rather than dismiss."
+        "You are a bearing fault classifier. "
+        "Given vibration features, classify the bearing condition. "
+        "Rules: de_kurtosis<1 AND de_crest_factor<3.5 → normal. "
+        "de_kurtosis>2 AND de_crest_factor>5 → outer_race. "
+        "de_kurtosis 1.5-2.5 AND de_impulse_factor>5 → inner_race. "
+        "de_kurtosis 1-2 → ball. "
+        "Respond ONLY with valid JSON, nothing else: "
+        "{\"label\": \"<normal|inner_race|ball|outer_race>\", "
+        "\"confidence\": <0.0-1.0>, "
+        "\"reasoning\": \"<one sentence>\"}"
     )
 
     def __init__(
         self,
-        model: str = "claude-3-5-sonnet-20241022",
-        max_tool_calls: int = 3,
+        model: str = "llama3.2:3b",
+        max_tool_calls: int = 1,
     ) -> None:
         self._model_name = model
         self._max_tool_calls = max_tool_calls
@@ -253,23 +295,84 @@ class LLMAgentPlugin:
         rag_source: str,
     ) -> AgentDecision:
         """Core agent execution — may raise; wrapped by ``reason``."""
+        # For local Ollama models, skip tool-binding (llama3.2 doesn't handle
+        # it reliably) and do a single direct call: RAG retrieve → prompt → parse.
+        llm = _build_llm(self._model_name)
+        is_ollama = self._model_name.startswith("ollama:") or any(
+            self._model_name.lower().startswith(p)
+            for p in ("llama", "mistral", "gemma", "phi", "qwen",
+                      "deepseek", "codellama", "vicuna", "falcon")
+        )
+
+        if is_ollama:
+            return self._run_ollama_direct(llm, event, context, rag_source)
+
+        return self._run_langgraph(llm, event, context, rag_source)
+
+    def _run_ollama_direct(
+        self,
+        llm: Any,
+        event: dict[str, Any],
+        context: dict[str, Any],
+        rag_source: str,
+    ) -> AgentDecision:
+        """
+        Single-shot Ollama call with inline knowledge (no RAG round-trip).
+        Avoids the ChromaDB query latency that dominates llama3.2 inference time.
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        # Inline the most critical decision thresholds directly — faster than RAG
+        INLINE_KB = (
+            "Calibrated thresholds from CWRU data: "
+            "de_kurtosis>3.5 → outer_race. "
+            "de_kurtosis 1.3-3.5 → inner_race. "
+            "de_kurtosis<1.3 AND de_rms>0.08 AND de_crest_factor>3.1 → ball. "
+            "de_kurtosis<1.3 AND de_rms<0.08 → normal. "
+            "outer_race has highest RMS (~0.6), inner_race moderate (~0.3), "
+            "ball slightly elevated (~0.15), normal lowest (~0.07)."
+        )
+
+        feature_summary = {
+            k: round(v, 4) if isinstance(v, float) else v
+            for k, v in event.items()
+            if k.startswith("de_") or k.startswith("fe_")
+        }
+
+        human_content = (
+            f"Knowledge: {INLINE_KB}\n\n"
+            f"Features: {json.dumps(feature_summary)}\n\n"
+            "Reply JSON only."
+        )
+
+        messages = [
+            SystemMessage(content=self.SYSTEM_PROMPT),
+            HumanMessage(content=human_content),
+        ]
+
+        response = llm.invoke(messages)
+        content = response.content if hasattr(response, "content") else str(response)
+        return self._parse_response(content, [])
+
+    def _run_langgraph(
+        self,
+        llm: Any,
+        event: dict[str, Any],
+        context: dict[str, Any],
+        rag_source: str,
+    ) -> AgentDecision:
+        """Full ReAct tool-calling path for Anthropic / capable models."""
         from langchain_core.messages import HumanMessage, SystemMessage
         from langchain_core.tools import tool as lc_tool
 
-        # Build tools
         rag_fn = _make_rag_tool(rag_source)
         ctx_fn = _make_context_tool(context)
-
-        # Wrap as LangChain tools
         rag_tool = lc_tool(rag_fn)
         ctx_tool = lc_tool(ctx_fn)
         tools = [rag_tool, ctx_tool]
 
-        # Build LLM
-        llm = _import_langchain_anthropic(self._model_name)
         llm_with_tools = llm.bind_tools(tools)
 
-        # Run a simple ReAct loop (no full LangGraph graph needed for ≤3 calls)
         messages = [
             SystemMessage(content=self.SYSTEM_PROMPT),
             HumanMessage(
@@ -291,7 +394,6 @@ class LLMAgentPlugin:
             if not response.tool_calls:
                 break
 
-            # Execute tool calls
             from langchain_core.messages import ToolMessage
 
             for tc in response.tool_calls:
@@ -301,7 +403,6 @@ class LLMAgentPlugin:
 
                 if tool_name == "rag_retrieve":
                     result = rag_fn(**tool_args)
-                    # Extract cited doc IDs from result
                     for line in result.split("\n"):
                         if line.startswith("["):
                             doc_id = line.split("]")[0].lstrip("[")
@@ -316,7 +417,6 @@ class LLMAgentPlugin:
                 )
                 tool_calls_made += 1
 
-        # Parse final response
         final_content = messages[-1].content if messages else ""
         return self._parse_response(final_content, sources)
 
@@ -352,23 +452,25 @@ class LLMAgentPlugin:
 
         # Heuristic: look for label keywords
         lower = content.lower()
-        # Check for explicit normal/clear phrases first (higher specificity)
-        normal_phrases = ("no incident", "no crash", "traffic is clear",
-                          "normal", "all clear", "no anomaly")
-        anomaly_phrases = ("crash", "anomaly", "alert")
-        # 'incident' alone is checked only when not negated
-        has_negated_incident = "no incident" in lower
-        has_incident = "incident" in lower and not has_negated_incident
-
-        if any(p in lower for p in normal_phrases):
-            label = "normal"
-            confidence = 0.7
-        elif any(p in lower for p in anomaly_phrases) or has_incident:
-            label = "anomaly"
-            confidence = 0.7
+        # Bearing fault labels (checked first — most specific)
+        bearing_labels = ("inner_race", "outer_race", "ball fault",
+                          "ball_fault", "rolling element")
+        if "inner_race" in lower or "inner race" in lower:
+            label, confidence = "inner_race", 0.7
+        elif "outer_race" in lower or "outer race" in lower:
+            label, confidence = "outer_race", 0.7
+        elif "ball fault" in lower or "ball_fault" in lower or "rolling element" in lower:
+            label, confidence = "ball", 0.7
+        # Generic anomaly / crash / normal keywords
+        elif any(p in lower for p in ("no fault", "healthy", "no anomaly")):
+            label, confidence = "normal", 0.7
+        elif any(p in lower for p in ("no incident", "no crash", "traffic is clear",
+                                       "normal", "all clear")):
+            label, confidence = "normal", 0.7
+        elif any(p in lower for p in ("crash", "anomaly", "fault", "alert", "incident")):
+            label, confidence = "anomaly", 0.7
         else:
-            label = "uncertain"
-            confidence = 0.4
+            label, confidence = "uncertain", 0.4
 
         return AgentDecision(
             label=label,
