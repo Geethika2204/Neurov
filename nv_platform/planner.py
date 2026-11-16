@@ -27,6 +27,7 @@ from typing import Any
 
 from nv_platform.implicit_layer import ReasoningScore
 from nv_platform.safety import SafetyResult
+from nv_platform.automatic_action import AutomaticActionResult
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,11 @@ class ActionPlan:
     """
     Structured, executable action plan produced by the Planner.
 
+    Both decision paths produce an ``ActionPlan`` — the fast SNN path gets a
+    short default/monitoring plan, the deliberative LLM path gets a detailed
+    context-aware plan — so escalation status never determines *whether* a
+    plan is produced, only how detailed it is.
+
     Attributes
     ----------
     label       : Final classification label.
@@ -46,7 +52,7 @@ class ActionPlan:
     reasoning   : Full reasoning chain (agent + planner).
     sources     : RAG document IDs that informed this plan.
     risk_score  : Risk score at decision time.
-    path        : "deliberative" — identifies this as the LLM path.
+    path        : "deliberative" (LLM) or "automatic" (fast SNN) path.
     safe        : Whether the safety checker approved this plan.
     """
     label: str = "uncertain"
@@ -66,6 +72,37 @@ class ActionPlan:
             "reasoning": self.reasoning,
             "sources": self.sources,
             "risk_score": self.risk_score,
+            "path": self.path,
+            "safe": self.safe,
+        }
+
+    @property
+    def action_steps(self) -> list[str]:
+        """Ordered action steps, exposed for Action Memory storage."""
+        return list(self.steps)
+
+    @property
+    def selected_action(self) -> str:
+        """The primary action selected by the system for this event.
+
+        For Path B this is the plan's first step; for Path A ``plan_automatic``
+        puts the automatic action first.  Falls back to the label if there are
+        no steps.  This gives the unified decision recorder a single,
+        path-agnostic notion of "the action selected".
+        """
+        return self.steps[0] if self.steps else self.label
+
+    def memory_record(self) -> dict[str, Any]:
+        """
+        Compact representation suitable for Action Memory storage.
+
+        Exposes the label, confidence, steps and path so Memory can later
+        evaluate which recommendations were effective.
+        """
+        return {
+            "label": self.label,
+            "confidence": self.confidence,
+            "steps": self.action_steps,
             "path": self.path,
             "safe": self.safe,
         }
@@ -204,4 +241,79 @@ class Planner:
             risk_score=risk,
             path="deliberative",
             safe=safety_result.safe,
+        )
+
+    # ------------------------------------------------------------------
+    # Fast path (Path A) — default plans for non-escalated events
+    # ------------------------------------------------------------------
+
+    # Default monitoring instructions for normal/borderline events.
+    _DEFAULT_NORMAL_STEPS: list[str] = ["continue_monitoring"]
+    _DEFAULT_MONITOR_STEPS: list[str] = [
+        "increase_sampling_rate",
+        "log_monitor_event",
+    ]
+
+    def plan_automatic(
+        self,
+        automatic_result: AutomaticActionResult,
+        score: ReasoningScore,
+        event: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> ActionPlan:
+        """
+        Build a default ActionPlan from a fast-path AutomaticActionResult.
+
+        Normal events get a small monitoring instruction; borderline events
+        get an increased-sampling plan.  When the fast path was informed by
+        a reliable confirmed memory match that was a crash, the plan flags
+        the event for human review even though it was not escalated — a
+        safety net for confirmed-similar crash patterns the gate let through.
+
+        This is the Path A counterpart of ``plan``: escalation status never
+        determines *whether* a plan is produced, only its complexity.
+        """
+        label = automatic_result.label
+        risk = score.risk
+
+        # Scale confidence with the fast-path confidence but keep it bounded
+        # by risk so a high-risk "normal" never looks over-confident.
+        confidence = automatic_result.confidence * (1.0 - risk * 0.2)
+        confidence = float(max(0.0, min(1.0, confidence)))
+
+        if label == "monitor":
+            steps = list(self._steps.get("monitor", self._DEFAULT_MONITOR_STEPS))
+        else:
+            steps = list(self._steps.get("normal", self._DEFAULT_NORMAL_STEPS))
+
+        # Use the exact action string the automatic path recommended so the
+        # downstream executor and memory see what was actually advised.
+        if automatic_result.action and automatic_result.action not in steps:
+            steps = [automatic_result.action] + steps
+
+        # Safety net: if the automatic path was memory-informed by a confirmed
+        # crash, flag for human review (the fast path cannot escalate, but it
+        # should not silently pass a known crash signature through).
+        safe = True
+        diag = automatic_result.memory_match
+        if diag and diag.get("was_crash"):
+            steps = ["human_review_required"] + steps
+            safe = False
+
+        reasoning = automatic_result.action
+        if diag:
+            reasoning += (
+                f" (memory-informed: sim={diag.get('similarity')}, "
+                f"was_crash={diag.get('was_crash')})"
+            )
+
+        return ActionPlan(
+            label=label,
+            confidence=confidence,
+            steps=steps,
+            reasoning=reasoning,
+            sources=[],
+            risk_score=risk,
+            path="automatic",
+            safe=safe,
         )

@@ -528,6 +528,19 @@ class CWRUPipeline:
             agent_ctx = {
                 "gate_confidence":     gate_conf,
                 "domain":              "bearing_fault_detection",
+                # Domain-owned classification knowledge, passed to the
+                # domain-agnostic agent plugin via context (the platform
+                # never hardcodes these rules).
+                "classification_guide": (
+                    "Bearing fault classification by vibration features. "
+                    "de_kurtosis>3.5 → outer_race. "
+                    "de_kurtosis 1.3-3.5 → inner_race. "
+                    "de_kurtosis<1.3 AND de_rms>0.08 AND de_crest_factor>3.1 → ball. "
+                    "de_kurtosis<1.3 AND de_rms<0.08 → normal. "
+                    "outer_race has highest RMS (~0.6), inner_race moderate (~0.3), "
+                    "ball slightly elevated (~0.15), normal lowest (~0.07)."
+                ),
+                "valid_labels": ["normal", "inner_race", "ball", "outer_race", "uncertain"],
                 "novelty":             round(float(score.novelty), 3),
                 "uncertainty":         round(float(score.uncertainty), 3),
                 "prediction_error":    round(float(score.prediction_error), 3),

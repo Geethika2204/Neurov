@@ -243,3 +243,146 @@ def test_baseline_comparison():
     )
 
     assert always_m["escalation_rate"] > thresh_m["escalation_rate"]
+
+
+# ---------------------------------------------------------------------------
+# Full-stack end-to-end decision→action→memory→feedback workflow
+# ---------------------------------------------------------------------------
+
+
+def test_decision_workflow_full_stack_with_domain():
+    """
+    Run the complete decision/action/memory/feedback workflow end-to-end
+    using the real SNN + ImplicitLayer stack and the TrafficDomain, wired
+    via an injected tensor_provider (keeping /nv_platform/ domain-free).
+
+    Verifies:
+      - Both decision paths produce an ActionPlan.
+      - Outcomes are verified from ground-truth labels (never predictions).
+      - Pending and confirmed feedback are kept separate.
+      - Continuous learning accumulates confusion counts and crash episodes.
+    """
+    from nv_platform.automatic_action import AutomaticAction
+    from nv_platform.safety import SafetyChecker
+    from nv_platform.planner import Planner
+    from nv_platform.memory_consolidation import MemoryConsolidation
+    from nv_platform.action_memory import ActionMemory
+    from nv_platform.action_executor import MockActionExecutor
+    from nv_platform.decision_workflow import DecisionWorkflow
+
+    domain = TrafficDomain()
+    snn = SNNInputPlugin(num_steps=10)
+    implicit = ImplicitPredictiveLayer(input_dim=12)
+    learner = GateLearner(update_every=1000)
+    # High threshold so the cold-start learner bias (≈0.73) does not
+    # escalate normal events; crashes still escalate via the hard floor.
+    gate = ReasoningGate(learner=learner, threshold=0.9)
+    agent = LLMAgentPlugin()
+    mem = ActionMemory()
+    consolidator = MemoryConsolidation(implicit, update_every=1000)
+
+    wf = DecisionWorkflow(
+        gate=gate,
+        agent=agent,
+        safety=SafetyChecker(),
+        planner=Planner(),
+        automatic_action=AutomaticAction(),
+        action_memory=mem,
+        action_executor=MockActionExecutor(),
+        memory_consolidation=consolidator,
+        implicit_layer=implicit,
+        snn=snn,
+        tensor_provider=domain.event_to_tensor,   # injected — no /platform/ domain import
+        knowledge_base_path=domain.knowledge_base_path,
+    )
+
+    events = _make_dummy_events(n=20)
+
+    def _mock_reason(event, context, rag_source):
+        # Crash label when the gate is highly confident, else normal.
+        return AgentDecision(
+            label="crash" if context.get("gate_confidence", 0.0) > 0.5 else "normal",
+            confidence=float(context.get("gate_confidence", 0.5)),
+            reasoning="mocked agent",
+            sources=[],
+        )
+
+    escalated = 0
+    with patch.object(agent, "reason", side_effect=_mock_reason):
+        for event in events:
+            res = wf.decide(event)
+            # Every decision produces an actionable plan (both paths).
+            assert len(res.action_plan.steps) >= 1
+            # Verify the outcome from the dataset ground-truth label.
+            wf.verify_outcome(
+                res.decision_id,
+                event=event,
+                context={"label": event["crash_record"]},
+            )
+            if res.escalated:
+                escalated += 1
+
+    stats = wf.stats()
+    n_crashes = sum(1 for e in events if e["crash_record"] == 1)
+    print(
+        f"\n[workflow] events={len(events)} escalated={escalated} "
+        f"confirmed={stats['action_memory']['confirmed']} "
+        f"crashes_in_data={n_crashes} "
+        f"confirmed_crashes={stats['action_memory']['confirmed_crashes']} "
+        f"tp={stats['action_memory']['tp']} "
+        f"fn={stats['action_memory']['fn']}"
+    )
+
+    # All events were verified and confirmed.
+    assert stats["action_memory"]["confirmed"] == len(events)
+    # Confirmed crashes in Action Memory match the dataset crash count.
+    assert stats["action_memory"]["confirmed_crashes"] == n_crashes
+    # Every decision was recorded (pending → confirmed lifecycle).
+    assert stats["action_memory"]["pending"] == 0
+
+
+def test_decision_workflow_records_decision_log_fields():
+    """Decision logging records id, signals, prediction, escalation status,
+    action plan and execution status — and ground truth never equals the
+    model's own prediction by construction."""
+    from nv_platform.automatic_action import AutomaticAction
+    from nv_platform.safety import SafetyChecker
+    from nv_platform.planner import Planner
+    from nv_platform.memory_consolidation import MemoryConsolidation
+    from nv_platform.action_memory import ActionMemory
+    from nv_platform.action_executor import MockActionExecutor
+    from nv_platform.decision_workflow import DecisionWorkflow
+
+    implicit = ImplicitPredictiveLayer(input_dim=12)
+    learner = GateLearner(update_every=1000)
+    gate = ReasoningGate(learner=learner, threshold=0.9)
+    agent = LLMAgentPlugin()
+    mem = ActionMemory()
+    wf = DecisionWorkflow(
+        gate=gate, agent=agent, safety=SafetyChecker(), planner=Planner(),
+        automatic_action=AutomaticAction(), action_memory=mem,
+        action_executor=MockActionExecutor(),
+        memory_consolidation=MemoryConsolidation(implicit, update_every=1000),
+        implicit_layer=implicit,
+    )
+
+    def _mock_reason(event, context, rag_source):
+        return AgentDecision(label="crash", confidence=0.9,
+                             reasoning="mocked", sources=[])
+
+    with patch.object(agent, "reason", side_effect=_mock_reason):
+        res = wf.decide({}, context={"score": ReasoningScore(
+            novelty=0.97, uncertainty=0.96, prediction_error=0.97,
+            memory_confidence=0.02, spatial_correlation=0.97, risk=0.97)})
+
+    rec = mem.get(res.decision_id)
+    # Decision-log fields present.
+    assert rec.decision_id == res.decision_id
+    assert rec.score_tensor is not None           # original signals
+    assert rec.predicted_label == "crash"          # prediction
+    assert rec.escalated is True                    # escalation status
+    assert rec.action_plan["label"] == "crash"      # action plan
+    assert rec.execution_status == "executed"       # execution status
+    # Ground truth not yet known → pending.
+    assert rec.outcome_status == "pending"
+    assert rec.actual_label is None

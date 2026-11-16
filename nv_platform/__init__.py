@@ -9,6 +9,18 @@ from nv_platform.automatic_action import AutomaticAction, AutomaticActionResult
 from nv_platform.safety import SafetyChecker, SafetyResult
 from nv_platform.planner import Planner, ActionPlan
 from nv_platform.memory_consolidation import MemoryConsolidation, Feedback, ConsolidationSummary
+from nv_platform.action_memory import ActionMemory, DecisionRecord, MemoryMatch
+from nv_platform.action_executor import (
+    ActionExecutor,
+    MockActionExecutor,
+    ExecutionResult,
+    OutcomeVerifier,
+    LabelOutcomeVerifier,
+    SimulatedOperatorFeedback,
+    OutcomeVerification,
+)
+from nv_platform.decision_recorder import DecisionRecorder, get_default_recorder
+from nv_platform.decision_workflow import DecisionWorkflow, WorkflowResult
 
 __all__ = [
     "DomainPlugin",
@@ -29,4 +41,18 @@ __all__ = [
     "MemoryConsolidation",
     "Feedback",
     "ConsolidationSummary",
+    "ActionMemory",
+    "DecisionRecord",
+    "MemoryMatch",
+    "ActionExecutor",
+    "MockActionExecutor",
+    "ExecutionResult",
+    "OutcomeVerifier",
+    "LabelOutcomeVerifier",
+    "SimulatedOperatorFeedback",
+    "OutcomeVerification",
+    "DecisionRecorder",
+    "get_default_recorder",
+    "DecisionWorkflow",
+    "WorkflowResult",
 ]

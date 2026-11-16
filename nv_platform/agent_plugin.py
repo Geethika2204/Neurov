@@ -239,17 +239,21 @@ class LLMAgentPlugin:
     >>> decision = agent.reason(event, context, "domains/traffic/rag_kb")
     """
 
-    SYSTEM_PROMPT = (
-        "You are a bearing fault classifier. "
-        "Given vibration features, classify the bearing condition. "
-        "Rules: de_kurtosis<1 AND de_crest_factor<3.5 → normal. "
-        "de_kurtosis>2 AND de_crest_factor>5 → outer_race. "
-        "de_kurtosis 1.5-2.5 AND de_impulse_factor>5 → inner_race. "
-        "de_kurtosis 1-2 → ball. "
-        "Respond ONLY with valid JSON, nothing else: "
-        "{\"label\": \"<normal|inner_race|ball|outer_race>\", "
-        "\"confidence\": <0.0-1.0>, "
-        "\"reasoning\": \"<one sentence>\"}"
+    # Generic, domain-agnostic classification prompt.  Domain-specific
+    # guidance is injected at call time via the ``context`` dict
+    # (``domain``, ``classification_guide``, ``valid_labels``), keeping this
+    # module free of any one dataset's rules.  This is the fallback used when
+    # the caller supplies no domain context.
+    BASE_SYSTEM_PROMPT = (
+        "You are a NeuroVerse anomaly classifier. "
+        "You receive sensor features and reasoning signals from a spike-based "
+        "predictive layer. Decide whether the event is normal or an anomaly "
+        "(crash / fault / incident) and explain your reasoning. "
+        "If domain-specific guidance is provided, follow it. "
+        'Respond ONLY with valid JSON, nothing else: '
+        '{"label": "<label>", '
+        '"confidence": <0.0-1.0>, '
+        '"reasoning": "<one sentence>"}'
     )
 
     def __init__(
@@ -259,10 +263,60 @@ class LLMAgentPlugin:
     ) -> None:
         self._model_name = model
         self._max_tool_calls = max_tool_calls
+        # Set True by ``reason`` whenever an LLM invocation is attempted on
+        # the deliberative path.  Read by the decision recorder to populate
+        # ``llm_called``.  Path A never calls ``reason``, so it stays False.
+        self.last_llm_invoked: bool = False
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    def _build_system_prompt(self, context: dict[str, Any]) -> str:
+        """
+        Construct a domain-aware system prompt from the supplied context.
+
+        Recognised context keys (all optional):
+        - ``domain``             : human-readable domain name.
+        - ``classification_guide``: domain-supplied rules / thresholds string.
+        - ``valid_labels``        : list of acceptable label strings.
+
+        Domains own their classification knowledge and pass it through the
+        platform-agnostic ``context`` dict, so the platform never hardcodes
+        one dataset's labels or thresholds.
+        """
+        if not context:
+            return self.BASE_SYSTEM_PROMPT
+
+        domain = context.get("domain")
+        guide = context.get("classification_guide")
+        valid_labels = context.get("valid_labels")
+
+        # No domain context at all → generic prompt.
+        if not (domain or guide or valid_labels):
+            return self.BASE_SYSTEM_PROMPT
+
+        parts: list[str] = []
+        if domain:
+            parts.append(f"You are the NeuroVerse classifier for the {domain} domain.")
+        else:
+            parts.append("You are the NeuroVerse anomaly classifier.")
+        parts.append(
+            "Given the sensor features and reasoning signals, classify the "
+            "event and explain your reasoning."
+        )
+        if guide:
+            parts.append(f"Classification guidance: {guide}")
+        if valid_labels:
+            label_list = ", ".join(str(l) for l in valid_labels)
+            parts.append(f"Valid labels: {label_list}.")
+        parts.append(
+            'Respond ONLY with valid JSON, nothing else: '
+            '{"label": "<label>", '
+            '"confidence": <0.0-1.0>, '
+            '"reasoning": "<one sentence>"}'
+        )
+        return " ".join(parts)
 
     def reason(
         self,
@@ -283,6 +337,10 @@ class LLMAgentPlugin:
         -------
         AgentDecision — always returns (never raises).
         """
+        # An LLM invocation is being attempted on the deliberative path.
+        # This is set before the call so the recorder reflects "LLM invoked"
+        # even when the call degrades to the fallback decision.
+        self.last_llm_invoked = True
         try:
             return self._run_agent(event, context, rag_source)
         except Exception as exc:  # noqa: BLE001
@@ -318,35 +376,39 @@ class LLMAgentPlugin:
     ) -> AgentDecision:
         """
         Single-shot Ollama call with inline knowledge (no RAG round-trip).
-        Avoids the ChromaDB query latency that dominates llama3.2 inference time.
+        Domain knowledge is injected via ``context`` (``inline_kb`` /
+        ``classification_guide``) so the platform never hardcodes a dataset's
+        thresholds.  Falls back to the generic prompt when none is supplied.
         """
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        # Inline the most critical decision thresholds directly — faster than RAG
-        INLINE_KB = (
-            "Calibrated thresholds from CWRU data: "
-            "de_kurtosis>3.5 → outer_race. "
-            "de_kurtosis 1.3-3.5 → inner_race. "
-            "de_kurtosis<1.3 AND de_rms>0.08 AND de_crest_factor>3.1 → ball. "
-            "de_kurtosis<1.3 AND de_rms<0.08 → normal. "
-            "outer_race has highest RMS (~0.6), inner_race moderate (~0.3), "
-            "ball slightly elevated (~0.15), normal lowest (~0.07)."
-        )
+        # Inline knowledge is optional and domain-supplied.  When absent we
+        # rely on the model's general reasoning plus the reasoning signals.
+        inline_kb = context.get("inline_kb") or context.get("classification_guide") or ""
 
         feature_summary = {
             k: round(v, 4) if isinstance(v, float) else v
             for k, v in event.items()
             if k.startswith("de_") or k.startswith("fe_")
+            or k.startswith("lane") or isinstance(v, (int, float))
         }
+        # Keep the feature summary compact for small-context local models.
+        if len(feature_summary) > 24:
+            feature_summary = dict(list(feature_summary.items())[:24])
 
         human_content = (
-            f"Knowledge: {INLINE_KB}\n\n"
-            f"Features: {json.dumps(feature_summary)}\n\n"
-            "Reply JSON only."
+            (f"Knowledge: {inline_kb}\n\n" if inline_kb else "")
+            + f"Features: {json.dumps(feature_summary)}\n\n"
+            "Reasoning signals: "
+            + json.dumps({k: context[k] for k in (
+                "novelty", "uncertainty", "prediction_error",
+                "memory_confidence", "spatial_correlation", "risk", "gate_confidence"
+            ) if k in context})
+            + "\n\nReply JSON only."
         )
 
         messages = [
-            SystemMessage(content=self.SYSTEM_PROMPT),
+            SystemMessage(content=self._build_system_prompt(context)),
             HumanMessage(content=human_content),
         ]
 
@@ -374,7 +436,7 @@ class LLMAgentPlugin:
         llm_with_tools = llm.bind_tools(tools)
 
         messages = [
-            SystemMessage(content=self.SYSTEM_PROMPT),
+            SystemMessage(content=self._build_system_prompt(context)),
             HumanMessage(
                 content=(
                     f"Sensor event: {json.dumps(event)}\n"

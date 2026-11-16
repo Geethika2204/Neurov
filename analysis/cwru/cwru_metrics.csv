@@ -1,0 +1,10 @@
+metric,value
+total_events,300
+escalated,200
+escalation_rate,0.667
+accuracy,1.0
+avg_latency_ms,6.6
+accuracy_inner_race,1.0
+accuracy_outer_race,1.0
+accuracy_normal,1.0
+accuracy_ball,1.0

@@ -29,11 +29,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 
 from nv_platform.implicit_layer import ImplicitPredictiveLayer, ReasoningScore
+
+if TYPE_CHECKING:
+    from nv_platform.action_memory import ActionMemory
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,15 @@ class Feedback:
     spike_vec     : Optional — the mean-pooled spike vector, used to update
                     long-term episodic memory for confirmed crashes.
     outcome_quality : Float in [0,1] — how well the action worked (optional).
+    verified      : bool — whether the outcome has been independently verified
+                    (ground-truth label or controlled simulation).  Only
+                    verified feedback drives learning; unverified feedback is
+                    recorded to Action Memory as pending but never touches the
+                    RiskHead weights or episodic store.  Defaults to True so
+                    existing callers (which always supply verified feedback)
+                    keep their prior behaviour.
+    actions_taken : list[str] — steps actually executed (for action-effectiveness
+                    evaluation).  Optional.
     """
     decision_id: str = ""
     actual_label: int = 0
@@ -61,6 +73,8 @@ class Feedback:
     score: ReasoningScore = field(default_factory=ReasoningScore)
     spike_vec: torch.Tensor | None = None
     outcome_quality: float = 1.0
+    verified: bool = True
+    actions_taken: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +92,10 @@ class ConsolidationSummary:
     episode_stored    : Whether a new long-term episode was stored.
     new_risk_weights  : Updated RiskHead weights (if changed).
     tp / fp / fn / tn : Running confusion matrix counts.
+    recorded_pending  : True when an *unverified* feedback was recorded to
+                        Action Memory as pending (no learning happened).
+    action_memory_confirmed : True when a verified outcome was confirmed in
+                              Action Memory.
     """
     weights_updated: bool = False
     episode_stored: bool = False
@@ -86,12 +104,16 @@ class ConsolidationSummary:
     fp: int = 0
     fn: int = 0
     tn: int = 0
+    recorded_pending: bool = False
+    action_memory_confirmed: bool = False
 
     def __repr__(self) -> str:
         return (
             f"ConsolidationSummary(weights_updated={self.weights_updated}, "
             f"episode_stored={self.episode_stored}, "
-            f"tp={self.tp}, fp={self.fp}, fn={self.fn}, tn={self.tn})"
+            f"tp={self.tp}, fp={self.fp}, fn={self.fn}, tn={self.tn}, "
+            f"recorded_pending={self.recorded_pending}, "
+            f"action_memory_confirmed={self.action_memory_confirmed})"
         )
 
 
@@ -115,6 +137,17 @@ class MemoryConsolidation:
     implicit_layer  : ImplicitPredictiveLayer  The layer to update.
     update_every    : int  Consolidate after this many feedbacks (default 20).
     fn_weight       : float  How much to amplify signals that missed crashes (default 2.0).
+    action_memory   : ActionMemory | None  When set, verified outcomes are
+                      confirmed in Action Memory so they can inform future
+                      decisions; unverified feedback is recorded as pending.
+
+    Verified vs pending
+    -------------------
+    Only feedback with ``verified=True`` reaches the RiskHead weight update
+    and the episodic store.  Unverified feedback is recorded to Action Memory
+    as pending (if attached) and otherwise ignored — it never influences
+    learning.  This is the invariant "only verified outcomes should reach
+    MemoryConsolidation and confirmed episodic/action memory."
     """
 
     def __init__(
@@ -122,33 +155,90 @@ class MemoryConsolidation:
         implicit_layer: ImplicitPredictiveLayer,
         update_every: int = _UPDATE_EVERY,
         fn_weight: float = 2.0,
+        action_memory: "ActionMemory | None" = None,
     ) -> None:
         self._layer = implicit_layer
         self._update_every = update_every
         self._fn_weight = fn_weight
+        self._memory = action_memory
         self._buffer: list[Feedback] = []
 
         # Running confusion matrix
         self._tp = self._fp = self._fn = self._tn = 0
 
+    @property
+    def action_memory(self) -> "ActionMemory | None":
+        return self._memory
+
+    @action_memory.setter
+    def action_memory(self, value: "ActionMemory | None") -> None:
+        self._memory = value
+
     def consolidate(self, feedback: Feedback) -> ConsolidationSummary:
         """
         Process one feedback event.
 
-        Parameters
-        ----------
-        feedback : Feedback
-
-        Returns
-        -------
-        ConsolidationSummary
+        Verified feedback drives learning (confusion matrix, episodic
+        store, RiskHead weight update) and is confirmed in Action Memory.
+        Unverified feedback is recorded to Action Memory as pending (when
+        attached) and skipped for learning.
         """
+        # --- Unverified path: record/track as pending, do NOT learn ---
+        if not feedback.verified:
+            recorded_pending = False
+            if self._memory is not None and feedback.decision_id:
+                from nv_platform.action_memory import DecisionRecord
+                # If the decision was already recorded (e.g. by the workflow),
+                # it already sits as pending — we just acknowledge that it is
+                # tracked without being learned from.  Otherwise create a
+                # pending record so the outcome is preserved until an
+                # independent verifier promotes it to confirmed.
+                if self._memory.get(feedback.decision_id) is None:
+                    self._memory.record_decision(
+                        DecisionRecord(
+                            decision_id=feedback.decision_id,
+                            score=feedback.score,
+                            score_tensor=feedback.score.as_tensor(),
+                            predicted_label=feedback.predicted_label,
+                            actual_label=None,
+                            outcome_status="pending",
+                            actions_taken=list(feedback.actions_taken),
+                        )
+                    )
+                recorded_pending = True
+            return ConsolidationSummary(
+                tp=self._tp, fp=self._fp, fn=self._fn, tn=self._tn,
+                recorded_pending=recorded_pending,
+                action_memory_confirmed=False,
+            )
+
+        # --- Verified path: this outcome is allowed to influence learning ---
         self._buffer.append(feedback)
         self._update_confusion(feedback)
 
         weights_updated = False
         episode_stored  = False
         new_weights: list[float] = []
+        action_memory_confirmed = False
+
+        # Confirm the verified outcome in Action Memory (decision → confirmed).
+        if self._memory is not None and feedback.decision_id:
+            confirmed = self._memory.confirm_outcome(
+                decision_id=feedback.decision_id,
+                actual_label=feedback.actual_label,
+                verified_success=self._effective(feedback),
+                feedback_note=f"consolidated verified outcome (label={feedback.actual_label})",
+            )
+            action_memory_confirmed = confirmed
+            # Attach the executed steps so action-effectiveness can be scored.
+            if confirmed and feedback.actions_taken:
+                rec = self._memory.get(feedback.decision_id)
+                if rec is not None and not rec.actions_taken:
+                    self._memory.record_action(
+                        feedback.decision_id,
+                        list(feedback.actions_taken),
+                        "executed",
+                    )
 
         # Store confirmed crash episodes in episodic memory
         if feedback.actual_label == 1 and feedback.spike_vec is not None:
@@ -170,7 +260,22 @@ class MemoryConsolidation:
             new_risk_weights=new_weights,
             tp=self._tp, fp=self._fp,
             fn=self._fn, tn=self._tn,
+            action_memory_confirmed=action_memory_confirmed,
         )
+
+    @staticmethod
+    def _effective(feedback: Feedback) -> bool:
+        """
+        Domain-agnostic effectiveness: the prediction agreed with the truth.
+        Uses the *actual* label (independent of the model) plus the model's
+        own predicted_label only to judge agreement — never as a substitute
+        for the ground truth.
+        """
+        predicted_positive = feedback.predicted_label in (
+            "crash", "anomaly", "alert", "inner_race", "outer_race", "ball",
+        )
+        actual_positive = feedback.actual_label == 1
+        return predicted_positive == actual_positive
 
     def _update_confusion(self, fb: Feedback) -> None:
         predicted_positive = fb.predicted_label in ("crash", "anomaly", "alert")

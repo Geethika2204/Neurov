@@ -1,0 +1,3 @@
+domain,gate,n_events,positive_events,escalated,escalation_rate,llm_call_reduction,recall,precision,f1,accuracy,fn,fp,tp,tn,avg_latency_ms
+traffic,ReasoningGate,28076,1372,14394,0.5127,0.4873,0.9708,0.0925,0.169,0.5333,40,13062,1332,13642,N/A
+cwru,ReasoningGate,300,75,200,0.667,0.333,1.0,1.0,1.0,1.0,0,0,75,75,6.6
