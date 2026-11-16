@@ -25,6 +25,14 @@ Training is done offline in ``train_gate.py`` using a standardised full-batch
 logistic regression.  ``predict_proba()`` applies the saved weights directly.
 The ``update()`` online path is retained for compatibility but should not be
 used in the main offline pipeline.
+
+Checkpoint domain tagging
+--------------------------
+Checkpoints saved by ``train_gate.py`` include a ``"domain"`` field.  When a
+checkpoint is loaded the caller should verify that the domain matches the
+intended application domain.  Attempting to load a checkpoint for a different
+domain will raise ``DomainMismatchError`` unless ``allow_domain_mismatch=True``
+is passed to the loader.
 """
 
 from __future__ import annotations
@@ -41,6 +49,30 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Domain mismatch error
+# ---------------------------------------------------------------------------
+
+class DomainMismatchError(ValueError):
+    """
+    Raised when a checkpoint trained for domain A is loaded for domain B
+    without an explicit opt-in.
+
+    Example
+    -------
+    >>> raise DomainMismatchError("traffic", "cwru")
+    """
+    def __init__(self, checkpoint_domain: str, expected_domain: str) -> None:
+        self.checkpoint_domain = checkpoint_domain
+        self.expected_domain   = expected_domain
+        super().__init__(
+            f"Checkpoint domain '{checkpoint_domain}' does not match "
+            f"the expected domain '{expected_domain}'. "
+            f"Retrain the gate on '{expected_domain}' data or pass "
+            f"allow_domain_mismatch=True to suppress this error."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Feature extraction — five danger signals only
 # ---------------------------------------------------------------------------
 
@@ -54,6 +86,15 @@ _FEATURE_DIM = 5  # prediction_error, uncertainty, spatial_correlation, risk, no
 #   [4] spatial_correlation
 #   [5] risk
 _SCORE_INDICES = [2, 1, 4, 5, 0]  # pred_error, uncertainty, spatial, risk, novelty
+
+# Human-readable names (same order as _SCORE_INDICES)
+FEATURE_NAMES = [
+    "prediction_error",
+    "uncertainty",
+    "spatial_correlation",
+    "risk",
+    "novelty",
+]
 
 
 def _extract_features(score_tensor: Tensor) -> Tensor:
@@ -117,7 +158,10 @@ class GateLearner:
         # any training data, preventing cold-start false negatives.
         nn.init.constant_(self._model.bias, 1.0)
 
-        # Standardisation statistics (set after offline training)
+        # Standardisation statistics (set after offline training).
+        # Default to zero-mean / unit-std (identity transform) so that an
+        # untrained learner still produces valid probabilities instead of
+        # exploding from mis-scaled inputs.
         self.feature_mean: Tensor = (
             feature_mean if feature_mean is not None
             else torch.zeros(_FEATURE_DIM)
@@ -131,28 +175,58 @@ class GateLearner:
         self._update_count = 0
 
     def _standardise(self, feats: Tensor) -> Tensor:
-        """Apply training-set standardisation to a feature vector or matrix."""
-        return (feats - self.feature_mean) / self.feature_std
+        """
+        Apply training-set standardisation to a feature vector or matrix.
+
+        Guards against near-zero standard deviations (clamps to ≥ 1e-6) so
+        a degenerate feature cannot produce infinite z-scores.
+        """
+        safe_std = self.feature_std.clamp(min=1e-6)
+        return (feats - self.feature_mean) / safe_std
 
     def predict_proba(
         self,
         score_tensor: Tensor,
         history: "EscalationHistory | None" = None,  # ignored; kept for back-compat
+        extra_features: Tensor | None = None,
     ) -> float:
         """
         Probability of escalation given the current score.
 
         Parameters
         ----------
-        score_tensor : Tensor, shape (6,)
-        history      : ignored (kept for API compatibility)
+        score_tensor    : Tensor, shape (6,)
+        history         : ignored (kept for API compatibility)
+        extra_features  : Optional Tensor of additional raw features to append
+                          to the 5-dim ImplicitLayer vector before scoring.
+                          Shape (k,) where k matches the extra dims the model
+                          was trained with.  If None, only the 5 standard
+                          features are used (backward-compatible).
 
         Returns
         -------
         float in [0, 1]
         """
         feats = _extract_features(score_tensor)
+        if extra_features is not None:
+            feats = torch.cat([feats, extra_features.float()])
         feats_scaled = self._standardise(feats)
+        # Dynamically resize the linear layer if the checkpoint dimension
+        # differs from the default (handles 5->7 augmentation without breaking
+        # the existing online-update path).
+        in_dim = feats_scaled.shape[0]
+        if self._model.in_features != in_dim:
+            import torch.nn as _nn
+            old_model = self._model
+            self._model = _nn.Linear(in_dim, 1)
+            _nn.init.zeros_(self._model.weight)
+            _nn.init.constant_(self._model.bias, 1.0)
+            # Copy shared weights for the first 5 dims if sizes align
+            with torch.no_grad():
+                shared = min(old_model.in_features, in_dim)
+                self._model.weight.data[0, :shared] = \
+                    old_model.weight.data[0, :shared]
+                self._model.bias.data.copy_(old_model.bias.data)
         with torch.no_grad():
             logit = self._model(feats_scaled.unsqueeze(0))
         return float(torch.sigmoid(logit).squeeze())

@@ -157,14 +157,20 @@ class ReasoningGate:
         self,
         score: ReasoningScore,
         history: EscalationHistory,
+        extra_features: "Tensor | None" = None,
     ) -> tuple[bool, float]:
         """
         Decide whether to escalate to the LLM agent.
 
         Parameters
         ----------
-        score   : ReasoningScore
-        history : EscalationHistory
+        score           : ReasoningScore
+        history         : EscalationHistory
+        extra_features  : Optional Tensor of additional raw features (e.g.
+                          de_rms, de_kurtosis) to append to the 5-dim
+                          ImplicitLayer vector before the learner scores them.
+                          Must match the extra dims the checkpoint was trained
+                          with.  None = use 5-feature baseline (back-compat).
 
         Returns
         -------
@@ -174,17 +180,6 @@ class ReasoningGate:
         score_tensor = score.as_tensor()
 
         # --- Hard escalation floor (FN protection) ---
-        # Only check signals where HIGH value = DANGER:
-        #   [0] novelty, [1] uncertainty, [2] prediction_error,
-        #   [4] spatial_correlation, [5] risk
-        # EXCLUDE [3] memory_confidence — high value = familiar = SAFE.
-        # Including it caused 100% hard-floor fires because memory fills with
-        # normal patterns and confidence saturates at ~0.998 >> 0.95.
-        #
-        # In training_mode the hard floor is BYPASSED so the learner's own
-        # probability drives every decision logged to history. If the hard
-        # floor overrides during training, all history entries have
-        # decision=True regardless of the learner → corrupted training signal.
         if self.training_mode:
             hard_escalate = False
         else:
@@ -198,7 +193,9 @@ class ReasoningGate:
             hard_escalate = bool((_danger > HARD_ESCALATE_THRESHOLD).any())
 
         # --- Learned probability ---
-        prob = self._learner.predict_proba(score_tensor, history)
+        prob = self._learner.predict_proba(
+            score_tensor, history, extra_features=extra_features
+        )
         escalate = hard_escalate or (prob >= self._threshold)
 
         # --- Log the decision ---

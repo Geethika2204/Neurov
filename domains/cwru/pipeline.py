@@ -259,34 +259,96 @@ class CWRUPipeline:
         self.history = EscalationHistory()
 
         # Load pretrained GateLearner weights if available.
-        # The logistic weights (5-dim) operate on ReasoningScore signals and
-        # are domain-agnostic, so they transfer from any trained checkpoint.
-        # We also take the threshold that was calibrated during training rather
-        # than using the hard-coded default.
-        _weights_path = Path(_REPO_ROOT) / "data" / "processed" / "gate_weights.pt"
-        if _weights_path.exists():
+        # Preferred: CWRU-specific checkpoint (cwru_gate_weights.pt).
+        # Fallback: generic checkpoint (gate_weights.pt) only if it carries the
+        # correct domain tag; a traffic-domain checkpoint is REJECTED to prevent
+        # silent cross-domain reuse (see diagnosis in gate_learner.py).
+        _cwru_weights_path    = Path(_REPO_ROOT) / "data" / "processed" / "cwru_gate_weights.pt"
+        _generic_weights_path = Path(_REPO_ROOT) / "data" / "processed" / "gate_weights.pt"
+
+        _loaded = False
+        for _candidate in [_cwru_weights_path, _generic_weights_path]:
+            if not _candidate.exists():
+                continue
             try:
-                ckpt = torch.load(str(_weights_path), map_location="cpu", weights_only=False)
                 import torch.nn as _nn
+                _ckpt = torch.load(str(_candidate), map_location="cpu", weights_only=False)
+
+                # Domain validation — reject checkpoints from other domains.
+                _ckpt_domain = _ckpt.get("domain", None)
+                if _ckpt_domain is not None and _ckpt_domain != "cwru":
+                    import warnings
+                    warnings.warn(
+                        f"CWRUPipeline: rejected checkpoint {_candidate.name} "
+                        f"(domain='{_ckpt_domain}', expected 'cwru'). "
+                        "Run domains/cwru/train_cwru_gate.py to generate a "
+                        "CWRU-specific checkpoint.",
+                        UserWarning,
+                    )
+                    continue
+
+                # Determine feature dimension from saved weights and resize
+                # the learner's linear layer accordingly (handles 5->7 augmentation).
+                _saved_weights = _ckpt["weights"]
+                _n_feats = int(_saved_weights.shape[0])
+                if self.gate_learner._model.in_features != _n_feats:
+                    import torch.nn as _nn2
+                    self.gate_learner._model = _nn2.Linear(_n_feats, 1)
+                    _nn2.init.zeros_(self.gate_learner._model.weight)
+                    _nn2.init.constant_(self.gate_learner._model.bias, 1.0)
+
+                # Load weights and normalisation statistics
                 with torch.no_grad():
-                    self.gate_learner._model.weight.copy_(ckpt["weights"].unsqueeze(0))
-                    self.gate_learner._model.bias.copy_(ckpt["bias"].unsqueeze(0))
-                self.gate_learner.feature_mean = ckpt["feature_mean"]
-                self.gate_learner.feature_std  = ckpt["feature_std"]
-                self.gate.threshold = float(ckpt["threshold"])
+                    self.gate_learner._model.weight.copy_(_saved_weights.unsqueeze(0))
+                    self.gate_learner._model.bias.copy_(_ckpt["bias"].unsqueeze(0))
+                self.gate_learner.feature_mean = _ckpt["feature_mean"]
+                self.gate_learner.feature_std  = _ckpt["feature_std"]
+                self.gate.threshold = float(_ckpt["threshold"])
+
+                # Restore the ImplicitPredictiveLayer state saved during training.
+                # Only attempt this if the checkpoint's input_dim matches the
+                # current pipeline's domain input_dim (18 for CWRU DE+FE).
+                # Silently skip for cross-domain checkpoints that differ in dim.
+                _ckpt_input_dim = _ckpt.get("input_dim", None)
+                if "layer" in _ckpt and _ckpt_input_dim == self.domain.num_features:
+                    try:
+                        self.implicit_layer.load_state_dict(_ckpt["layer"])
+                    except Exception as _layer_exc:  # noqa: BLE001
+                        import warnings
+                        warnings.warn(
+                            f"CWRUPipeline: could not restore ImplicitLayer state "
+                            f"from {_candidate.name} — {_layer_exc}. "
+                            "Continuing with uninitialised layer.",
+                            UserWarning,
+                        )
+
+                _domain_label = _ckpt_domain if _ckpt_domain else "unknown-domain"
                 import warnings
                 warnings.warn(
-                    f"CWRUPipeline: loaded GateLearner weights from {_weights_path} "
-                    f"(threshold={self.gate.threshold:.4f})",
+                    f"CWRUPipeline: loaded GateLearner weights from "
+                    f"{_candidate.name} "
+                    f"(domain='{_domain_label}', "
+                    f"threshold={self.gate.threshold:.4f})",
                     UserWarning,
                 )
+                _loaded = True
+                break
             except Exception as exc:  # noqa: BLE001
                 import warnings
                 warnings.warn(
-                    f"CWRUPipeline: could not load gate weights — {exc}. "
-                    "Using default initialisation.",
+                    f"CWRUPipeline: could not load gate weights from "
+                    f"{_candidate.name} — {exc}. Skipping.",
                     UserWarning,
                 )
+
+        if not _loaded:
+            import warnings
+            warnings.warn(
+                "CWRUPipeline: no valid CWRU gate checkpoint found. "
+                "Using default initialisation (threshold=0.5). "
+                "Run domains/cwru/train_cwru_gate.py to train a CWRU gate.",
+                UserWarning,
+            )
 
         # Data pipeline
         self.loader = CWRULoader(data_root=data_root)
@@ -444,7 +506,19 @@ class CWRUPipeline:
         score = self.implicit_layer.compute_state(spikes)
 
         # --- Layer 3: Gate ---
-        escalate, gate_conf = self.gate.should_escalate(score, self.history)
+        # Pass raw vibration features if the checkpoint uses augmented 7-dim features.
+        _n_feats = self.gate_learner._model.in_features if hasattr(self.gate_learner._model, 'in_features') else 5
+        _extra = None
+        if _n_feats > 5:
+            _raw_for_gate = event.get("_raw", event)
+            _extra = torch.tensor(
+                [float(_raw_for_gate.get("de_rms", 0.0)),
+                 float(_raw_for_gate.get("de_kurtosis", 0.0))],
+                dtype=torch.float32,
+            )
+        escalate, gate_conf = self.gate.should_escalate(
+            score, self.history, extra_features=_extra
+        )
 
         # --- Layer 4: LLM or fast-path ---
         if escalate and self.agent is not None:
