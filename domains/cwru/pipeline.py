@@ -254,6 +254,7 @@ class CWRUPipeline:
             input_dim=self.domain.num_features
         )
         self.gate_learner = GateLearner()
+        self.gate_learner.update_every = 10**9  # disable online update during eval
         self.gate = ReasoningGate(learner=self.gate_learner, threshold=0.5)
         self.agent = LLMAgentPlugin(model=llm_model) if enable_llm else None
         self.history = EscalationHistory()

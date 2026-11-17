@@ -321,6 +321,7 @@ def run(
     max_per_class: int | None = None,
     data_root: str = "domains/cwru",
     compare: bool = False,
+    output_path: str | None = None,
 ) -> None:
     loader = CWRULoader(data_root)
     all_records = loader.load_all()
@@ -416,12 +417,17 @@ def run(
         print("Run:  python domains/cwru/train_cwru_gate.py")
         learner_cwru, threshold_cwru, domain_tag = GateLearner(), 0.5, "none"
         n_extra_features = 0
+    learner_cwru.update_every = 10**9  # disable online update during eval
     gate_cwru = ReasoningGate(learner=learner_cwru, threshold=threshold_cwru)
     results_cwru = run_evaluation(test_norm, thresh, gate_cwru, domain, snn, layer2,
                                    label="CWRU gate",
                                    n_extra_features=n_extra_features)
     results_cwru["threshold"] = threshold_cwru
     _print_results(results_cwru, thresh)
+
+    # Save results to JSON if output path provided
+    if output_path:
+        _save_results(results_cwru, thresh, output_path)
 
     if not compare:
         return
@@ -440,6 +446,7 @@ def run(
         print(f"Generic checkpoint not found — skipping comparison")
         return
 
+    learner_old.update_every = 10**9  # disable online update during eval
     gate_old = ReasoningGate(learner=learner_old, threshold=threshold_old)
     results_old = run_evaluation(test_norm, thresh, gate_old, domain, snn, layer2,
                                   label="Traffic gate (old)",
@@ -451,6 +458,46 @@ def run(
     print("BEFORE / AFTER COMPARISON")
     print("=" * 60)
     _print_comparison(results_old, results_cwru)
+
+
+def _save_results(r: dict, thresh: dict, output_path: str) -> None:
+    """Save evaluation results to a JSON file."""
+    import json
+    from pathlib import Path
+
+    # Convert non-serializable values
+    out = {
+        "label": r["label"],
+        "threshold": r.get("threshold", "N/A"),
+        "total_test_windows": r["total"],
+        "escalated": r["escalated"],
+        "not_escalated": r["not_escalated"],
+        "escalation_rate": round(r["esc_rate"], 4),
+        "llm_calls_saved": r["llm_calls_saved"],
+        "hard_floor_fires": r["hard_floor_fires"],
+        "gate_conf_mean": round(r["gate_conf_mean"], 4),
+        "gate_conf_std": round(r["gate_conf_std"], 4),
+        "classification_accuracy": round(r["accuracy"], 4),
+        "fault_escalation_recall": round(r["fault_recall"], 4),
+        "normal_false_esc_rate": round(r["normal_fp_rate"], 4),
+        "gate_precision": round(r["gate_precision"], 4),
+        "per_class": {},
+        "confusion_matrix": r["conf_mat"],
+        "thresholds": {k: round(v, 4) for k, v in thresh.items()},
+    }
+    for cls in CLASSES:
+        out["per_class"][cls] = {
+            "correct": r["per_class_correct"][cls],
+            "total": r["per_class_total"][cls],
+            "accuracy": round(r["per_class_correct"][cls] / max(r["per_class_total"][cls], 1), 4),
+            "escalated": r["per_class_esc"][cls],
+            "esc_pct": round(r["per_class_esc"][cls] / max(r["per_class_total"][cls], 1), 4),
+        }
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"\n  Results saved to {output_path}")
 
 
 def _print_results(r: dict, thresh: dict) -> None:
@@ -535,5 +582,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-root", default="domains/cwru")
     parser.add_argument("--compare", action="store_true",
                         help="Also run with the original traffic checkpoint for comparison")
+    parser.add_argument("--output", default=None,
+                        help="Optional JSON file path to save results.")
     args = parser.parse_args()
-    run(max_per_class=args.max_per_class, data_root=args.data_root, compare=args.compare)
+    run(max_per_class=args.max_per_class, data_root=args.data_root,
+        compare=args.compare, output_path=args.output)

@@ -1,0 +1,80 @@
+{
+  "label": "CWRU gate",
+  "threshold": 0.9500000000000001,
+  "total_test_windows": 1659,
+  "escalated": 696,
+  "not_escalated": 963,
+  "escalation_rate": 0.4195,
+  "llm_calls_saved": 963,
+  "hard_floor_fires": 0,
+  "gate_conf_mean": 0.4337,
+  "gate_conf_std": 0.4853,
+  "classification_accuracy": 1.0,
+  "fault_escalation_recall": 0.9762,
+  "normal_false_esc_rate": 0.0,
+  "gate_precision": 1.0,
+  "per_class": {
+    "normal": {
+      "correct": 946,
+      "total": 946,
+      "accuracy": 1.0,
+      "escalated": 0,
+      "esc_pct": 0.0
+    },
+    "inner_race": {
+      "correct": 239,
+      "total": 239,
+      "accuracy": 1.0,
+      "escalated": 239,
+      "esc_pct": 1.0
+    },
+    "ball": {
+      "correct": 236,
+      "total": 236,
+      "accuracy": 1.0,
+      "escalated": 219,
+      "esc_pct": 0.928
+    },
+    "outer_race": {
+      "correct": 238,
+      "total": 238,
+      "accuracy": 1.0,
+      "escalated": 238,
+      "esc_pct": 1.0
+    }
+  },
+  "confusion_matrix": {
+    "normal": {
+      "normal": 946,
+      "inner_race": 0,
+      "ball": 0,
+      "outer_race": 0
+    },
+    "inner_race": {
+      "normal": 0,
+      "inner_race": 239,
+      "ball": 0,
+      "outer_race": 0
+    },
+    "ball": {
+      "normal": 0,
+      "inner_race": 0,
+      "ball": 236,
+      "outer_race": 0
+    },
+    "outer_race": {
+      "normal": 0,
+      "inner_race": 0,
+      "ball": 0,
+      "outer_race": 238
+    }
+  },
+  "thresholds": {
+    "z_outer": 1.3581,
+    "z_inner": 0.0149,
+    "z_ball": -0.502,
+    "raw_outer": 3.5634,
+    "raw_inner": 1.0813,
+    "raw_ball": 0.1028
+  }
+}
